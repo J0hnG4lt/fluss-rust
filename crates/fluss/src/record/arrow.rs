@@ -890,21 +890,56 @@ impl LogRecordBatch {
         LittleEndian::read_i32(&self.data[offset..offset + RECORDS_COUNT_LENGTH])
     }
 
+    pub fn is_append_only(&self) -> bool {
+        self.attributes() & 1 == 1
+    }
+
     pub fn records(&self, read_context: &ReadContext) -> Result<LogRecordIterator> {
         if self.record_count() == 0 {
             return Ok(LogRecordIterator::empty());
         }
 
-        let data = &self.data[RECORDS_OFFSET..];
+        let record_count = self.record_count() as usize;
+        let (arrow_data, change_types) = if self.is_append_only() {
+            let data = &self.data[RECORDS_OFFSET..];
+            let ct = vec![ChangeType::AppendOnly; record_count];
+            (data, ct)
+        } else {
+            // Non-append-only: first `record_count` bytes are per-record ChangeType values,
+            // followed by the Arrow IPC data.
+            let ct_start = RECORDS_OFFSET;
+            let ct_end = ct_start + record_count;
+            if self.data.len() < ct_end {
+                return Err(Error::UnexpectedError {
+                    message: format!(
+                        "Corrupt log record batch: data length {} too short for {} change type bytes",
+                        self.data.len(),
+                        record_count
+                    ),
+                    source: None,
+                });
+            }
+            let ct_bytes = &self.data[ct_start..ct_end];
+            let ct: std::result::Result<Vec<ChangeType>, String> = ct_bytes
+                .iter()
+                .map(|&b| ChangeType::from_byte_value(b))
+                .collect();
+            let ct = ct.map_err(|e| Error::UnexpectedError {
+                message: format!("Invalid change type in record batch: {e}"),
+                source: None,
+            })?;
+            let data = &self.data[ct_end..];
+            (data, ct)
+        };
 
-        let record_batch = read_context.record_batch(data)?;
+        let record_batch = read_context.record_batch(arrow_data)?;
         let arrow_reader = ArrowReader::new(Arc::new(record_batch));
         let log_record_iterator = LogRecordIterator::Arrow(ArrowLogRecordIterator {
             reader: arrow_reader,
             base_offset: self.base_log_offset(),
             timestamp: self.commit_timestamp(),
             row_id: 0,
-            change_type: ChangeType::AppendOnly,
+            change_types,
         });
 
         Ok(log_record_iterator)
@@ -915,9 +950,38 @@ impl LogRecordBatch {
             return Ok(LogRecordIterator::empty());
         }
 
-        let data = &self.data[RECORDS_OFFSET..];
+        let record_count = self.record_count() as usize;
+        let (arrow_data, change_types) = if self.is_append_only() {
+            let data = &self.data[RECORDS_OFFSET..];
+            let ct = vec![ChangeType::AppendOnly; record_count];
+            (data, ct)
+        } else {
+            let ct_start = RECORDS_OFFSET;
+            let ct_end = ct_start + record_count;
+            if self.data.len() < ct_end {
+                return Err(Error::UnexpectedError {
+                    message: format!(
+                        "Corrupt log record batch: data length {} too short for {} change type bytes",
+                        self.data.len(),
+                        record_count
+                    ),
+                    source: None,
+                });
+            }
+            let ct_bytes = &self.data[ct_start..ct_end];
+            let ct: std::result::Result<Vec<ChangeType>, String> = ct_bytes
+                .iter()
+                .map(|&b| ChangeType::from_byte_value(b))
+                .collect();
+            let ct = ct.map_err(|e| Error::UnexpectedError {
+                message: format!("Invalid change type in record batch: {e}"),
+                source: None,
+            })?;
+            let data = &self.data[ct_end..];
+            (data, ct)
+        };
 
-        let record_batch = read_context.record_batch_for_remote_log(data)?;
+        let record_batch = read_context.record_batch_for_remote_log(arrow_data)?;
         let log_record_iterator = match record_batch {
             None => LogRecordIterator::empty(),
             Some(record_batch) => {
@@ -927,7 +991,7 @@ impl LogRecordBatch {
                     base_offset: self.base_log_offset(),
                     timestamp: self.commit_timestamp(),
                     row_id: 0,
-                    change_type: ChangeType::AppendOnly,
+                    change_types,
                 })
             }
         };
@@ -943,14 +1007,22 @@ impl LogRecordBatch {
             return Ok(RecordBatch::new_empty(read_context.target_schema.clone()));
         }
 
+        // For non-append-only batches, skip the ChangeTypeVector bytes
+        // before the Arrow IPC data.
+        let arrow_start = if self.is_append_only() {
+            RECORDS_OFFSET
+        } else {
+            RECORDS_OFFSET + self.record_count() as usize
+        };
+
         let data = self
             .data
-            .get(RECORDS_OFFSET..)
+            .get(arrow_start..)
             .ok_or_else(|| Error::UnexpectedError {
                 message: format!(
-                    "Corrupt log record batch: data length {} is less than RECORDS_OFFSET {}",
+                    "Corrupt log record batch: data length {} is less than arrow data offset {}",
                     self.data.len(),
-                    RECORDS_OFFSET
+                    arrow_start
                 ),
                 source: None,
             })?;
@@ -1407,18 +1479,18 @@ pub struct ArrowLogRecordIterator {
     base_offset: i64,
     timestamp: i64,
     row_id: usize,
-    change_type: ChangeType,
+    change_types: Vec<ChangeType>,
 }
 
 #[allow(dead_code)]
 impl ArrowLogRecordIterator {
-    fn new(reader: ArrowReader, base_offset: i64, timestamp: i64, change_type: ChangeType) -> Self {
+    fn new(reader: ArrowReader, base_offset: i64, timestamp: i64, change_types: Vec<ChangeType>) -> Self {
         Self {
             reader,
             base_offset,
             timestamp,
             row_id: 0,
-            change_type,
+            change_types,
         }
     }
 }
@@ -1431,12 +1503,17 @@ impl Iterator for ArrowLogRecordIterator {
             return None;
         }
 
+        let change_type = self
+            .change_types
+            .get(self.row_id)
+            .copied()
+            .unwrap_or(ChangeType::AppendOnly);
         let columnar_row = self.reader.read(self.row_id);
         let scan_record = ScanRecord::new(
             columnar_row,
             self.base_offset + self.row_id as i64,
             self.timestamp,
-            self.change_type,
+            change_type,
         );
         self.row_id += 1;
         Some(scan_record)
