@@ -24,6 +24,7 @@ mod integration {
     mod fluss_cluster;
     mod kv_table;
     mod log_table;
+    mod pk_table_cdc;
     mod sasl_auth;
 
     mod utils;
